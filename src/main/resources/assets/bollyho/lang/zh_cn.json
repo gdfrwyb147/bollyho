@@ -1,0 +1,9 @@
+{
+  "itemGroup.bollyho": "Bollyho",
+
+  "block.bollyho.scope_block": "炮镜",
+  "item.bollyho.scope_block": "炮镜",
+
+  "bollyho.scope.view.enter": "进入炮镜视角...",
+  "bollyho.scope.view.exit": "退出炮镜视角..."
+}

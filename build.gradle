@@ -1,0 +1,219 @@
+plugins {
+    id 'java-library'//gradle官方内置的java库插件
+    id 'maven-publish'//gradle官方的maven发布插件，提供publishing快用来把构建产物发布到maven仓库
+    id 'net.neoforged.gradle.userdev' version '7.1.38'//neoforge官方插件，提供run块，生成mod运行环境
+}
+
+tasks.named('wrapper', Wrapper).configure {
+    //官方翻译：
+    // 在此处定义 wrapper 相关的值，这样后续更新 gradlew.properties 时就不必每次都手动设置。
+    //如果将此处切换为 Wrapper.DistributionType.ALL，将会下载完整的 Gradle 源码，附带文档，
+    // 这样在光标悬停于 Gradle 的类和方法上时就能看到相应的文档说明。但代价是 Gradle 的文件体积会增大。
+    //如果你确实切换为 ALL，请在之后运行两次 Gradle wrapper 任务。
+    // （可通过检查 gradle/wrapper/gradle-wrapper.properties 来验证，确认 distributionUrl 是否已指向 -all 版本。）
+    distributionType = Wrapper.DistributionType.BIN//只下载二进制版本，不带源码和文档
+}
+
+version = mod_version//构建的产物的版本
+group = mod_group_id//maven坐标的group部分
+
+sourceSets.main.resources {
+    //在此处包含数据生成器生成的资源
+    //把 src/generated/resources 目录加进主资源集。这个目录里的文件是 Data Generation（数据生成，简称 datagen） 跑完后产出的，
+    // 比如自动生成的配方、标签、掉落表、模型 JSON 等。NeoForge 的 datagen 跑完会输出到这里。
+    srcDir('src/generated/resources')
+
+    //  从最终输出中排除仅用于开发的通用资源文件
+    //排除所有 BlockBench 项目文件。.bbmodel 是 BlockBench（一个 3D 模型制作软件）的工程文件，
+    // 开发时用来建模/调参，但不应该被打进最终的 jar——玩家端不需要它，MC 也不认识它，打进 jar 纯属浪费空间。
+    exclude("**/*.bbmodel") // BlockBench project files
+    //排除 datagen 的缓存目录。NeoForge datagen 跑完会在输出目录下留一个 .cache 文件夹
+    // 记录文件哈希，用来增量判断"哪些文件变了需要重写"。这玩意是构建工具内部用的，不能进 jar。
+    exclude("src/generated/**/.cache") // datagen cache files
+}
+
+repositories {
+    //flatDir 是 Gradle 的一种简易本地仓库类型。它指向一个文件系统目录，
+    // Gradle 会把这个目录下所有的 .jar（和 .pom）当成一个 Maven 仓库来用
+    flatDir {
+        //dirs 'libs'：指向项目根目录下的 libs 文件夹。
+        dirs 'libs'
+    }
+    // 如果下面的某些依赖需要额外的仓库，请在此处添加
+}
+//build.gradle标准配置
+//base是插件：用来控制构建产物的基础命名
+base {
+    //把 jar 的基础文件名绑定到 gradle.properties 里的 mod_id 变量
+    archivesName = mod_id
+}
+
+// Mojang 在 1.21.1 版本向终端用户发布的是 Java 21，因此模组也应面向 Java 21 编译。
+//告诉 Gradle "编译时用哪个 Java 版本的语法 / 类库 / 字节码格式"
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+//minecraft.accessTransformers.file rootProject.file('src/main/resources/META-INF/accesstransformer.cfg')
+//访问转换器文件：使用项目根目录下的 src/main/resources/META-INF/accesstransformer.cfg。
+// 如需使用 AT，取消下面的注释并配置 accesstransformer.cfg 文件。
+// 炮镜视角功能目前用反射替代 AT 访问 Camera.setPosition。
+
+// 默认的运行配置
+// 可以按需调整、删除或复制多份
+runs {
+    // 适用于下面所有运行配置
+    //里面写的内容对后面每一条具体的 client / server / data 运行配置都生效，不用重复写。
+    configureEach {
+        // Recommended logging data for a userdev environment
+        //用户开发环境推荐的日志标记
+        // The markers can be added/remove as needed separated by commas.
+        //可按需增删，用逗号分隔。
+        // "SCAN": For mods scan.
+        //用于模组扫描日志
+        // "REGISTRIES": For firing of registry events.
+        //用于注册事件触发时的日志
+        // "REGISTRYDUMP": For getting the contents of all registries.
+        //用于输出所有注册表里的内容（调试时看所有方块/物品/实体被注册成啥 id）
+        //systemProperty：往运行中的 JVM 塞一个系统属性，MC/NeoForge 代码会读它
+        //forge.logging.markers：NeoForge 日志系统的开关，默认只开 REGISTRIES，这样你能在控制台看到哪个方块被注册了、注册事件什么时候触发。
+        systemProperty 'forge.logging.markers', 'REGISTRIES'
+
+        // Recommended logging level for the console
+        //控制台推荐的日志级别
+        // You can set various levels here.
+        //这里可以设置不同级别
+        // Please read: https://stackoverflow.com/questions/2031163/when-to-use-the-different-log-levels
+        //详见：（StackOverflow 链接讲 Java 日志级别用法）
+        //debug：把 DEBUG 及以上（DEBUG / INFO / WARN / ERROR）的日志全打出来。开发调试时方便。
+        //如果嫌日志太多，可以改成 info，DEBUG 级别的就不显示了
+        systemProperty 'forge.logging.console.level', 'debug'
+
+        workingDirectory project.layout.projectDirectory.dir('run').dir(name)
+
+        modSource project.sourceSets.main
+    }
+
+    client {
+        // Comma-separated list of namespaces to load gametests from. Empty = all namespaces.
+        systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+    }
+
+    server {
+        systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        argument '--nogui'
+    }
+
+    // This run config launches GameTestServer and runs all registered gametests, then exits.
+    // By default, the server will crash when no gametests are provided.
+    // The gametest system is also enabled by default for other run configs under the /test command.
+    gameTestServer {
+        systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+    }
+
+    data {
+        // example of overriding the workingDirectory set in configureEach above, uncomment if you want to use it
+        // workingDirectory project.file('run-data')
+
+        // Specify the modid for data generation, where to output the resulting resource, and where to look for existing resources.
+        arguments.addAll '--mod', project.mod_id, '--all', '--output', file('src/generated/resources/').getAbsolutePath(), '--existing', file('src/main/resources/').getAbsolutePath()
+    }
+}
+
+// Sets up a dependency configuration called 'localRuntime'.
+// This configuration should be used instead of 'runtimeOnly' to declare
+// a dependency that will be present for runtime testing but that is
+// "optional", meaning it will not be pulled by dependents of this mod.
+configurations {
+    runtimeClasspath.extendsFrom localRuntime
+}
+
+dependencies {
+    // Specify the version of Minecraft to use.
+    // Depending on the plugin applied there are several options. We will assume you applied the userdev plugin as shown above.
+    // The group for userdev is net.neoforged, the module name is neoforge, and the version is the same as the neoforge version.
+    // You can however also use the vanilla plugin (net.neoforged.gradle.vanilla) to use a version of Minecraft without the neoforge loader.
+    // And its provides the option to then use net.minecraft as the group, and one of; client, server or joined as the module name, plus the game version as version.
+    // For all intends and purposes: You can treat this dependency as if it is a normal library you would use.
+    implementation "net.neoforged:neoforge:${neo_version}"
+
+    // Example optional mod dependency with JEI
+    // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
+    // compileOnly "mezz.jei:jei-${mc_version}-common-api:${jei_version}"
+    // compileOnly "mezz.jei:jei-${mc_version}-neoforge-api:${jei_version}"
+    // We add the full version to localRuntime, not runtimeOnly, so that we do not publish a dependency on it
+    // localRuntime "mezz.jei:jei-${mc_version}-neoforge:${jei_version}"
+
+    // 测试用的外部模组，放在 ./libs/ 目录下
+    // localRuntime：仅在开发运行时加载，不会被打包进最终产物，不会声明为依赖
+    // 文件名请用英文，避免编码问题
+    localRuntime files(
+            "libs/create-1.21.1-6.0.10.jar",                              // 机械动力
+            "libs/sable-neoforge-1.21.1-2.0.3.jar",                        // sable
+            "libs/create-aeronautics-bundled-1.21.1-1.3.0.jar",            // 航空学
+            "libs/CBC-Military-Supplement-1.21.1-2.1.0.jar",               // CBC 军事补充
+            "libs/CBCmoreshells-1.1.6.jar",                                // CBC 更多炮弹
+            // 机械动力：伪装方块+
+            "libs/[机械动力：伪装方块+] copycats-3.0.4+mc.1.21.1-neoforge.jar",
+            // 机械动力：火炮
+            "libs/[机械动力：火炮] createbigcannons-5.11.7+mc.1.21.1.jar",
+            "libs/cbc_compact_mount-1.2.2.jar",                            // CBC 紧凑炮座
+            // CBC 火力组件
+            "libs/cbc_firepower_components-neoforge-1.21.1-0.3.2+mc.1.21.1-neoforge.jar",
+            "libs/cbcmodernwarfare-0.0.6v+mc.1.21.1-neoforge.jar",        // CBC 现代战争
+            "libs/ritchiesprojectilelib-2.1.2+mc.1.21.1-neoforge.jar"   // Ritchie 投掷物库
+    )
+
+    // Example project dependency using a sister or child project:
+    // implementation project(":myproject")
+
+    // For more info:
+    // http://www.gradle.org/docs/current/userguide/artifact_dependencies_tutorial.html
+    // http://www.gradle.org/docs/current/userguide/dependency_management.html
+}
+
+// This block of code expands all declared replace properties in the specified resource targets.
+// A missing property will result in an error. Properties are expanded using ${} Groovy notation.
+// When "copyIdeResources" is enabled, this will also run before the game launches in IDE environments.
+// See https://docs.gradle.org/current/dsl/org.gradle.language.jvm.tasks.ProcessResources.html
+tasks.withType(ProcessResources).configureEach {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/neoforge.mods.toml']) {
+        expand replaceProperties
+    }
+}
+
+// Example configuration to allow publishing using the maven-publish plugin
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            url "file://${project.projectDir}/repo"
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
+}
+
+// IDEA no longer automatically downloads sources/javadoc jars for dependencies, so we need to explicitly enable the behavior.
+idea {
+    module {
+        downloadSources = true
+        downloadJavadoc = true
+    }
+}

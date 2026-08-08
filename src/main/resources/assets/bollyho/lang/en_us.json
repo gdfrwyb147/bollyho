@@ -1,0 +1,9 @@
+{
+  "itemGroup.bollyho": "Bollyho",
+
+  "block.bollyho.scope_block": "Cannon Scope",
+  "item.bollyho.scope_block": "Cannon Scope",
+
+  "bollyho.scope.view.enter": "Entering scope view...",
+  "bollyho.scope.view.exit": "Exiting scope view..."
+}

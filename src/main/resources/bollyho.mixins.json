@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.aero.bollyho.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "refmap": "bollyho.refmap.json",
+  "mixins": [],
+  "client": [
+    "BlockRenderDispatcherMixin",
+    "CameraMixin"
+  ],
+  "server": []
+}
