@@ -41,3 +41,7 @@ repo/
 
 ### Local mod dependencies (binary jars, kept only in development) ###
 libs/
+
+### Decompiled temp artifacts (created during debugging) ###
+temp_create/
+temp_extract/

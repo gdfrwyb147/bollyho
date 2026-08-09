@@ -156,6 +156,18 @@ public final class ScopeViewHandler {
             CbcIntegration.getInstance().scanForCannon(level, scopePos, scopeFacing);
         }
 
+        // 立即尝试 SubLevel 跟踪（参考 createrenxin）：
+        // 玩家在船上右键炮镜时，level = SubLevel 内部 Level，pos = 内部坐标。
+        // tryTrackInSubLevel 用坐标定位 SubLevel，无需搜索轴承。
+        if (level instanceof ClientLevel cl) {
+            boolean tracked = SableIntegration.getInstance()
+                    .tryTrackInSubLevel(cl, scopePos, targetPos, scopeFacing);
+            if (tracked) {
+                BollyhoMod.LOGGER.info("[DEBUG] ScopeView: 进入视角即激活 SubLevel 跟踪！"
+                        + " scopePos={} targetPos={} facing={}", scopePos, targetPos, scopeFacing);
+            }
+        }
+
         BollyhoMod.LOGGER.debug("进入炮镜视角: scopePos={}, facing={}, targetPos={}",
                 scopePos, scopeFacing, targetPos);
     }
@@ -295,6 +307,26 @@ public final class ScopeViewHandler {
             // ============================================================
             // 主世界跟踪模式
             // ============================================================
+
+            // 周期性尝试 SubLevel 跟踪（用玩家所在 Level，可能是 SubLevel 内部 Level）。
+            // 即使炮镜在内部 Level"原位"可见，也应尝试用坐标定位 SubLevel。
+            if (handler.subLevelRetryCount <= MAX_SUBLEVEL_RETRIES
+                    && handler.debugSubLevelTick % 20 == 0
+                    && level instanceof ClientLevel clientLevel2
+                    && sable.tryTrackInSubLevel(clientLevel2, handler.scopePos,
+                            handler.targetPos, handler.scopeFacing)) {
+                handler.subLevelRetryCount = 0;
+                BollyhoMod.LOGGER.info("[DEBUG] ScopeView: 炮镜已转入 SubLevel 跟踪模式(周期尝试)！"
+                        + " scopePos={} targetPos={} facing={}",
+                        handler.scopePos, handler.targetPos, handler.scopeFacing);
+                handler.recalculateFromSubLevel(mc);
+                return;
+            }
+            if (handler.debugSubLevelTick % 20 == 0 && handler.subLevelRetryCount <= MAX_SUBLEVEL_RETRIES) {
+                handler.subLevelRetryCount++;
+            }
+            handler.debugSubLevelTick++;
+
             BlockState state = level.getBlockState(handler.scopePos);
             BlockPos oldTargetPos = handler.targetPos;
 
@@ -329,7 +361,7 @@ public final class ScopeViewHandler {
                     handler.scopePos = newPos;
                     handler.scopeFacing = newFacing;
                     handler.targetPos = findPenetrationTarget(level, newPos, newFacing);
-                } else if (mc.level instanceof ClientLevel clientLevel
+                } else if (level instanceof ClientLevel clientLevel
                         && sable.tryTrackInSubLevel(clientLevel, handler.scopePos,
                                 handler.targetPos, handler.scopeFacing)) {
                     // 主世界找不到 → 在 Sable SubLevel 中搜索成功

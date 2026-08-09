@@ -1,6 +1,7 @@
 package com.aero.bollyho.client;
 
 import com.aero.bollyho.BollyhoMod;
+import com.aero.bollyho.block.ScopeBlock;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -9,6 +10,7 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Method;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -53,6 +55,8 @@ public final class SableIntegration {
             "dev.ryanhcode.sable.companion.math.Pose3dc";
     private static final String SUBLEVEL_CLASS =
             "dev.ryanhcode.sable.sublevel.SubLevel";
+    private static final String PLOT_CLASS =
+            "dev.ryanhcode.sable.sublevel.plot.LevelPlot";
 
     // ---- 航空学类名 ----
     private static final String SWIVEL_BE_CLASS =
@@ -66,6 +70,9 @@ public final class SableIntegration {
     // ---- 缓存的 Method 引用 ----
     private Method getContainerMethod;
     private Method getSubLevelMethod;
+    private Method getAllSubLevelsMethod;
+    private Method getPlotMethod;
+    private Method plotGetSubLevelMethod;
     private Method isRemovedMethod;
     private Method logicalPoseMethod;
     private Method renderPoseMethod;
@@ -75,6 +82,8 @@ public final class SableIntegration {
     private Method vec3dcXMethod;
     private Method vec3dcYMethod;
     private Method vec3dcZMethod;
+    private Method subLevelGetLevelMethod;
+    private Method subLevelGetUniqueIdMethod;
     private boolean methodsResolved;
 
     // ---- 跟踪状态 ----
@@ -89,6 +98,9 @@ public final class SableIntegration {
 
     /** 炮镜朝向在 SubLevel 局部空间中的方向向量 */
     private Vec3 localFacingVec;
+
+    /** 炮镜上方在 SubLevel 局部空间中的方向向量（用于世界空间上方向量） */
+    private Vec3 localUpVec = new Vec3(0, 1, 0);
 
     // ==================== 运动学轴承跟踪（主世界模式） ====================
     /** 运动学模式下缓存的轴承方块位置（null 表示未跟踪） */
@@ -187,37 +199,31 @@ public final class SableIntegration {
                 return false;
             }
 
-            // 2. 在主世界中搜索附近的 SwivelBearingBlockEntity
-            UUID subLevelId = findSubLevelIdFromBearing(clientLevel, scopeWorldPos);
-            if (subLevelId == null) {
-                BollyhoMod.LOGGER.debug("Sable: 未找到附近的 SwivelBearingBlockEntity");
-                return false;
+            // 2. 用坐标直接定位 SubLevel（参考 createrenxin 的 findSubLevelId）：
+            //    container.getPlot(new ChunkPos(pos)).getSubLevel()
+            //    炮镜可能在主世界坐标中（装配前最后位置），也可能在 SubLevel 内部
+            //    坐标中。先按给定坐标找 plot，找不到再遍历所有 SubLevel。
+            Object subLevel = findSubLevelByPos(container, scopeWorldPos);
+            if (subLevel == null) {
+                // 回退：遍历所有已加载 SubLevel，验证炮镜在哪个内部 Level 中
+                subLevel = findSubLevelContainingScope(container, scopeWorldPos);
             }
-
-            // 3. 通过 UUID 获取 SubLevel
-            Object subLevel = getSubLevelMethod.invoke(container, subLevelId);
             if (subLevel == null || (boolean) isRemovedMethod.invoke(subLevel)) {
-                BollyhoMod.LOGGER.debug("Sable: SubLevel 不存在或已移除: {}", subLevelId);
+                BollyhoMod.LOGGER.debug("Sable: 坐标定位 SubLevel 失败");
                 return false;
             }
 
-            // 4. 获取 SubLevel 原点 = logicalPose.position()
-            //    assembleBlocks() 将原点设为锚点方块中心，随后调整为质心
-            //    此原点在轴承旋转时不变（只有朝向被 RotaryConstraintHandle 驱动旋转）
-            Object logicalPose = logicalPoseMethod.invoke(subLevel);
-            Object posVec = posePositionMethod.invoke(logicalPose);
-            double originX = (double) vec3dcXMethod.invoke(posVec);
-            double originY = (double) vec3dcYMethod.invoke(posVec);
-            double originZ = (double) vec3dcZMethod.invoke(posVec);
-            Vec3 subLevelOrigin = new Vec3(originX, originY, originZ);
-
-            // 5. 计算局部偏移量
-            Vec3 scopeWorldCenter = new Vec3(
+            // 3. 直接用 SubLevel 内部坐标（plot 坐标）作为偏移量。
+            //    关键（参考 createrenxin）：不要减去 origin！
+            //    renderPose.transformPosition(内部坐标) 内部会完成 plot→世界的转换。
+            //    scopeWorldPos / targetWorldPos 是玩家所在 Level 中的坐标
+            //    （如果玩家在 SubLevel 内，它们就是内部坐标）。
+            Vec3 scopeCenter = new Vec3(
                     scopeWorldPos.getX() + 0.5,
                     scopeWorldPos.getY() + 0.5,
                     scopeWorldPos.getZ() + 0.5
             );
-            Vec3 targetWorldCenter = new Vec3(
+            Vec3 targetCenter = new Vec3(
                     targetWorldPos.getX() + 0.5,
                     targetWorldPos.getY() + 0.5,
                     targetWorldPos.getZ() + 0.5
@@ -228,14 +234,15 @@ public final class SableIntegration {
                     scopeFacing.getStepZ()
             );
 
-            this.localScopeOffset = scopeWorldCenter.subtract(subLevelOrigin);
-            this.localTargetOffset = targetWorldCenter.subtract(subLevelOrigin);
+            this.localScopeOffset = scopeCenter;
+            this.localTargetOffset = targetCenter;
             this.localFacingVec = facingVec;
             this.trackedSubLevel = subLevel;
 
+            Object uuid = subLevelGetUniqueIdMethod.invoke(subLevel);
             BollyhoMod.LOGGER.info(
-                    "Sable: 已初始化 SubLevel 跟踪: subLevelId={}, origin=({}), scopeOffset=({}), targetOffset=({}), facing=({})",
-                    subLevelId, subLevelOrigin, localScopeOffset, localTargetOffset, localFacingVec);
+                    "Sable: 已初始化 SubLevel 跟踪(坐标定位): subLevelId={}, scopeOffset(plot)={}, targetOffset(plot)={}, facing=({})",
+                    uuid, localScopeOffset, localTargetOffset, localFacingVec);
             return true;
 
         } catch (Exception e) {
@@ -243,6 +250,70 @@ public final class SableIntegration {
             clearCache();
             return false;
         }
+    }
+
+    /**
+     * 通过坐标定位 SubLevel（参考 createrenxin 的 findSubLevelId）
+     *
+     * <p>流程：{@code container.getPlot(new ChunkPos(pos)).getSubLevel()}</p>
+     *
+     * @param container SubLevelContainer
+     * @param pos       玩家所在 Level 中的坐标（可能为 SubLevel 内部坐标）
+     * @return SubLevel 或 null
+     */
+    private Object findSubLevelByPos(Object container, BlockPos pos) {
+        try {
+            Object plot = getPlotMethod.invoke(container, new net.minecraft.world.level.ChunkPos(pos));
+            if (plot == null) return null;
+            Object subLevel = plotGetSubLevelMethod.invoke(plot);
+            return subLevel;
+        } catch (Exception e) {
+            BollyhoMod.LOGGER.debug("[DEBUG] Sable: findSubLevelByPos 异常: {}", e.toString());
+            return null;
+        }
+    }
+
+    /**
+     * 遍历所有已加载 SubLevel，验证哪个包含炮镜方块（回退方案）
+     *
+     * @param container SubLevelContainer
+     * @param scopeWorldPos 炮镜最后已知位置
+     * @return 包含炮镜的 SubLevel 或 null
+     */
+    private Object findSubLevelContainingScope(Object container, BlockPos scopeWorldPos) {
+        try {
+            Object allSubLevels = getAllSubLevelsMethod.invoke(container);
+            if (!(allSubLevels instanceof List<?> list)) return null;
+
+            for (Object subLevel : list) {
+                if (subLevel == null || (boolean) isRemovedMethod.invoke(subLevel)) continue;
+                Level internalLevel = (Level) subLevelGetLevelMethod.invoke(subLevel);
+                if (internalLevel == null) continue;
+
+                // 在内部 Level 中验证炮镜方块（内部坐标 = 世界大小坐标）
+                BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
+                int radius = 8;
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dy = -radius; dy <= radius; dy++) {
+                        for (int dz = -radius; dz <= radius; dz++) {
+                            mutable.set(
+                                    scopeWorldPos.getX() + dx,
+                                    scopeWorldPos.getY() + dy,
+                                    scopeWorldPos.getZ() + dz);
+                            if (internalLevel.getBlockState(mutable).getBlock() instanceof ScopeBlock) {
+                                BollyhoMod.LOGGER.info(
+                                        "[DEBUG] Sable: 在SubLevel内部验证到炮镜! subLevelId={}, scopePos={}",
+                                        subLevelGetUniqueIdMethod.invoke(subLevel), mutable.immutable());
+                                return subLevel;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            BollyhoMod.LOGGER.warn("[DEBUG] Sable: findSubLevelContainingScope 异常", e);
+        }
+        return null;
     }
 
     /**
@@ -306,55 +377,97 @@ public final class SableIntegration {
     }
 
     /**
-     * 获取相机在当前帧的连续偏航角（非离散 Direction）
+     * 获取炮镜在当前帧的世界空间前向向量（连续精度）
      *
-     * <p>将 SubLevel 局部朝向向量通过 renderPose 变换到世界空间，
-     * 再用 atan2 计算连续偏航角。这避免了对 Direction.getNearest()
-     * 的离散化，使得轴承旋转时视角平滑过渡。</p>
+     * <p>用 {@code renderPose.transformNormal(localTargetOffset - localScopeOffset)}
+     * 计算前向（参考 createrenxin 的 lookLocal - cameraLocal），
+     * 归一化后返回。此方法供 CameraMixin 设置完整四元数旋转。</p>
      *
      * @param partialTick 部分 tick
-     * @return 偏航角（度），如果未跟踪则返回 null
+     * @return 归一化世界空间前向向量，失败返回 null
      */
-    public Float getCameraYaw(float partialTick) {
-        if (!isTracking() || localFacingVec == null) return null;
+    public Vec3 getWorldForward(float partialTick) {
+        if (!isTracking() || localScopeOffset == null || localTargetOffset == null) return null;
 
         try {
             Object pose = getRenderPoseObj(trackedSubLevel, partialTick);
             if (pose == null) return null;
-            Vec3 worldDir = (Vec3) transformNormalMethod.invoke(pose, localFacingVec);
-            // MC 偏航角: atan2(x, z); 0=南, 90=西, 180/-180=北, -90=东
-            float yaw = (float) Math.toDegrees(Math.atan2(worldDir.x, worldDir.z));
-            debugLogPerFrame("getCameraYaw", "worldDir=(" + String.format("%.2f,%.2f,%.2f", worldDir.x, worldDir.y, worldDir.z) + ") yaw=" + String.format("%.1f", yaw));
-            return yaw;
+            // 局部前向 = target - scope（plot 坐标差是纯方向）
+            Vec3 localDir = localTargetOffset.subtract(localScopeOffset);
+            double dirLen = localDir.length();
+            if (dirLen < 0.0001) {
+                // 退化：fallback 到 facing 方向
+                localDir = localFacingVec;
+            }
+            Vec3 worldDir = (Vec3) transformNormalMethod.invoke(pose, localDir);
+            double len = worldDir.length();
+            if (len < 0.0001) return null;
+            return new Vec3(worldDir.x / len, worldDir.y / len, worldDir.z / len);
         } catch (Exception e) {
-            BollyhoMod.LOGGER.error("Sable: 相机偏航角计算失败", e);
+            BollyhoMod.LOGGER.error("Sable: 世界前向向量计算失败", e);
             return null;
         }
     }
 
     /**
+     * 获取炮镜在当前帧的世界空间上方向量
+     *
+     * <p>用 {@code renderPose.transformNormal(0, 1, 0)} 计算
+     * （参考 createrenxin 的 up 向量）。</p>
+     *
+     * @param partialTick 部分 tick
+     * @return 归一化世界空间上方向量，失败返回 null
+     */
+    public Vec3 getWorldUp(float partialTick) {
+        if (!isTracking() || localUpVec == null) return null;
+
+        try {
+            Object pose = getRenderPoseObj(trackedSubLevel, partialTick);
+            if (pose == null) return null;
+            Vec3 worldUp = (Vec3) transformNormalMethod.invoke(pose, localUpVec);
+            double len = worldUp.length();
+            if (len < 0.0001) return null;
+            return new Vec3(worldUp.x / len, worldUp.y / len, worldUp.z / len);
+        } catch (Exception e) {
+            BollyhoMod.LOGGER.error("Sable: 世界上方向量计算失败", e);
+            return null;
+        }
+    }
+
+    /**
+     * 获取相机在当前帧的连续偏航角（非离散 Direction）
+     *
+     * <p>通过 {@link #getWorldForward(float)} 计算连续偏航角。
+     * MC 偏航角: atan2(x, z); 0=南, 90=西, 180/-180=北, -90=东</p>
+     *
+     * @param partialTick 部分 tick
+     * @return 偏航角（度），如果未跟踪则返回 null
+     */
+    public Float getCameraYaw(float partialTick) {
+        Vec3 worldForward = getWorldForward(partialTick);
+        if (worldForward == null) return null;
+        float yaw = (float) Math.toDegrees(Math.atan2(worldForward.x, worldForward.z));
+        debugLogPerFrame("getCameraYaw", "worldForward=("
+                + String.format("%.2f,%.2f,%.2f", worldForward.x, worldForward.y, worldForward.z)
+                + ") yaw=" + String.format("%.1f", yaw));
+        return yaw;
+    }
+
+    /**
      * 获取相机在当前帧的连续俯仰角（非离散 Direction）
      *
-     * <p>同样通过 renderPose.transformNormal 变换后计算俯仰角。
+     * <p>通过 {@link #getWorldForward(float)} 计算俯仰角。
      * MC 俯仰角：负=朝上，正=朝下。</p>
      *
      * @param partialTick 部分 tick
      * @return 俯仰角（度），如果未跟踪则返回 null
      */
     public Float getCameraPitch(float partialTick) {
-        if (!isTracking() || localFacingVec == null) return null;
-
-        try {
-            Object pose = getRenderPoseObj(trackedSubLevel, partialTick);
-            if (pose == null) return null;
-            Vec3 worldDir = (Vec3) transformNormalMethod.invoke(pose, localFacingVec);
-            // MC 俯仰角: atan2(-y, horizontalDist); 负=朝上, 正=朝下
-            double horizontalDist = Math.sqrt(worldDir.x * worldDir.x + worldDir.z * worldDir.z);
-            return (float) Math.toDegrees(Math.atan2(-worldDir.y, horizontalDist));
-        } catch (Exception e) {
-            BollyhoMod.LOGGER.error("Sable: 相机俯仰角计算失败", e);
-            return null;
-        }
+        Vec3 worldForward = getWorldForward(partialTick);
+        if (worldForward == null) return null;
+        double horizontalDist = Math.sqrt(
+                worldForward.x * worldForward.x + worldForward.z * worldForward.z);
+        return (float) Math.toDegrees(Math.atan2(-worldForward.y, horizontalDist));
     }
 
     /**
@@ -370,6 +483,7 @@ public final class SableIntegration {
         localScopeOffset = null;
         localTargetOffset = null;
         localFacingVec = null;
+        localUpVec = new Vec3(0, 1, 0);
         clearKinematicTracking();
         debugFrameCounter = 0;
         renderPoseFallbackCount = 0;
@@ -404,11 +518,19 @@ public final class SableIntegration {
             Class<?> subContainerClass = Class.forName(SUBCONTAINER_CLASS);
             getContainerMethod = subContainerClass.getMethod("getContainer", ClientLevel.class);
             getSubLevelMethod = subContainerClass.getMethod("getSubLevel", UUID.class);
+            getAllSubLevelsMethod = subContainerClass.getMethod("getAllSubLevels");
+            getPlotMethod = subContainerClass.getMethod("getPlot", net.minecraft.world.level.ChunkPos.class);
+
+            // LevelPlot.getSubLevel() → SubLevel
+            Class<?> levelPlotClass = Class.forName(PLOT_CLASS);
+            plotGetSubLevelMethod = levelPlotClass.getMethod("getSubLevel");
 
             // SubLevel
             Class<?> subLevelClass = Class.forName(SUBLEVEL_CLASS);
             isRemovedMethod = subLevelClass.getMethod("isRemoved");
             logicalPoseMethod = subLevelClass.getMethod("logicalPose");
+            subLevelGetLevelMethod = subLevelClass.getMethod("getLevel");
+            subLevelGetUniqueIdMethod = subLevelClass.getMethod("getUniqueId");
 
             // ClientSubLevel.renderPose(float) → Pose3dc
             try {
@@ -639,41 +761,5 @@ public final class SableIntegration {
             }
         }
         return logicalPoseMethod.invoke(subLevel);
-    }
-
-    /**
-     * 在主世界中搜索附近的 SwivelBearingBlockEntity，读取 subLevelID
-     */
-    private UUID findSubLevelIdFromBearing(ClientLevel clientLevel, BlockPos near) {
-        BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
-        int radius = 8;
-
-        try {
-            Class<?> swivelBeClass = Class.forName(SWIVEL_BE_CLASS);
-
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dy = -radius; dy <= radius; dy++) {
-                    for (int dz = -radius; dz <= radius; dz++) {
-                        mutable.set(near.getX() + dx, near.getY() + dy, near.getZ() + dz);
-                        BlockEntity be = clientLevel.getBlockEntity(mutable);
-                        if (be != null && swivelBeClass.isInstance(be)) {
-                            Method getSubLevelIdMethod =
-                                    swivelBeClass.getMethod("getSubLevelID");
-                            UUID uuid = (UUID) getSubLevelIdMethod.invoke(be);
-                            if (uuid != null) {
-                                BollyhoMod.LOGGER.info(
-                                        "Sable: 找到 SwivelBearing subLevelID={}, pos={}",
-                                        uuid, mutable);
-                                return uuid;
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            BollyhoMod.LOGGER.warn("Sable: 搜索 SwivelBearing 失败", e);
-        }
-
-        return null;
     }
 }
