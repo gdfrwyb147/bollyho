@@ -111,6 +111,22 @@ config="${mod_id}.mixins.json"
     ordering="AFTER"
     side="BOTH"
 
+# Sable — 物理引擎，航空学的前置，炮镜 SubLevel 跟踪必需
+[[dependencies.${mod_id}]]
+    modId="sable"
+    type="required"
+    versionRange="[2.0,)"
+    ordering="AFTER"
+    side="BOTH"
+
+# 航空学（Simulated）— 旋转轴承，炮镜安装在旋转轴承上时跟踪必需
+[[dependencies.${mod_id}]]
+    modId="simulated"
+    type="required"
+    versionRange="[1.3,)"
+    ordering="AFTER"
+    side="BOTH"
+
 # Features are specific properties of the game environment, that you may want to declare you require. This example declares
 # that your mod requires GL version 3.2 or higher. Other features will be added. They are side aware so declaring this won't
 # stop your mod loading on the server for example.

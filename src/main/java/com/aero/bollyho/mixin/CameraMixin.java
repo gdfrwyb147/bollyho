@@ -1,10 +1,13 @@
 package com.aero.bollyho.mixin;
 
+import com.aero.bollyho.client.CbcIntegration;
+import com.aero.bollyho.client.SableIntegration;
 import com.aero.bollyho.client.ScopeViewHandler;
 import net.minecraft.client.Camera;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.phys.Vec3;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -14,8 +17,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * 相机 Mixin
  *
- * <p>在炮镜视角中，覆盖相机位置为目标方块中心。
- * 注入在 {@link Camera#setPosition(double, double, double)} 之后，
+ * <p>在炮镜视角中，覆盖相机位置。相机放置位置取决于火炮底座类型：</p>
+ * <ul>
+ *   <li><b>原版 CBC 火炮底座</b> — 相机放在火炮底座方块中心（旋转轴）</li>
+ *   <li><b>紧凑式火炮底座 / 无火炮</b> — 相机放在目标方块中心</li>
+ * </ul>
+ *
+ * <p>注入在 {@link Camera#setPosition(double, double, double)} 之后，
  * 确保覆盖原版设置的实体位置。</p>
  *
  * <h3>为什么需要这个 Mixin？</h3>
@@ -40,8 +48,13 @@ public abstract class CameraMixin {
     /**
      * 在 {@code Camera.setup()} 返回前，覆盖相机位置
      *
-     * <p>只覆盖非 detached（非第三人称）模式，因为炮镜视角始终是第一人称。
-     * 如果处于炮镜视角，将相机移到目标方块中心。</p>
+     * <p>只覆盖非 detached（非第三人称）模式，因为炮镜视角始终是第一人称。</p>
+     *
+     * <p>位置选择逻辑：</p>
+     * <ul>
+     *   <li>原版 CBC 火炮底座 → 相机放在火炮底座方块中心（旋转轴所在位置）</li>
+     *   <li>紧凑式火炮底座 / 无火炮 → 相机放在目标方块中心</li>
+     * </ul>
      *
      * @param level             世界
      * @param entity            实体（未使用）
@@ -57,12 +70,38 @@ public abstract class CameraMixin {
             return;
         }
 
+        SableIntegration sable = SableIntegration.getInstance();
+
+        // SubLevel 跟踪模式：使用 Vec3 精度的相机位置（保留小数，避免截断抖动）
+        if (sable.isTracking()) {
+            Vec3 subLevelPos = handler.getSubLevelCameraPos();
+            if (subLevelPos != null) {
+                this.setPosition(subLevelPos.x, subLevelPos.y, subLevelPos.z);
+                return;
+            }
+        }
+
+        CbcIntegration cbc = CbcIntegration.getInstance();
+
+        // 原版 CBC 火炮底座 → 相机放在火炮底座中心（旋转轴）
+        if (cbc.getCannonType() == CbcIntegration.CannonType.ORIGINAL_CBC) {
+            BlockPos cannonPos = cbc.getCachedCannonPos();
+            if (cannonPos != null) {
+                this.setPosition(
+                        cannonPos.getX() + 0.5,
+                        cannonPos.getY() + 0.5,
+                        cannonPos.getZ() + 0.5
+                );
+                return;
+            }
+        }
+
+        // 紧凑式火炮底座 / 无火炮 → 相机放在目标方块中心
         BlockPos targetPos = handler.getTargetPos();
         if (targetPos == null) {
             return;
         }
 
-        // 相机放在目标方块的正中心
         this.setPosition(
                 targetPos.getX() + 0.5,
                 targetPos.getY() + 0.5,

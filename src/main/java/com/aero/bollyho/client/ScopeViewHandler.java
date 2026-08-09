@@ -3,11 +3,13 @@ package com.aero.bollyho.client;
 import com.aero.bollyho.BollyhoMod;
 import com.aero.bollyho.block.ScopeBlock;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -63,6 +65,53 @@ public final class ScopeViewHandler {
 
     /** 上一帧潜行键是否被按下（用于检测"按下瞬间"） */
     private boolean wasSneaking;
+
+    // ==================== SubLevel 跟踪重试 ====================
+
+    /**
+     * SubLevel 跟踪重试计数器
+     *
+     * <p>当炮镜从主世界消失（被旋转轴承装配到 SubLevel）时，
+     * SubLevel 数据可能还没从服务器同步到客户端（1-2 tick 延迟）。
+     * 此计数器允许在放弃前重试若干次。</p>
+     */
+    private int subLevelRetryCount;
+
+    /**
+     * SubLevel 跟踪最大重试次数（20 ticks = 1 秒）
+     * <p>远超典型的网络同步延迟（1-3 ticks），确保不会误退出。</p>
+     */
+    private static final int MAX_SUBLEVEL_RETRIES = 20;
+
+    // ==================== SubLevel 连续角度跟踪 ====================
+
+    /**
+     * 从 SubLevel 的 renderPose 计算出的连续偏航角（度）
+     *
+     * <p>不同于 {@link #scopeFacing}（离散 Direction），这是从
+     * {@code renderPose.transformNormal()} 通过 atan2 计算的连续值，
+     * 使得轴承旋转时视角平滑过渡而非跳变。</p>
+     */
+    private float subLevelYaw;
+
+    /**
+     * 从 SubLevel 的 renderPose 计算出的连续俯仰角（度）
+     */
+    private float subLevelPitch;
+
+    /**
+     * 从 SubLevel 的 renderPose 计算出的相机世界坐标（Vec3 精度）
+     *
+     * <p>相比 {@link #targetPos}（BlockPos 精度），此字段保留小数部分，
+     * 在 SubLevel 旋转时相机位置更加平滑。</p>
+     */
+    private Vec3 subLevelCameraPos;
+
+    /** 调试：SubLevel 跟踪帧计数器 */
+    int debugSubLevelTick;
+
+    /** 调试：onCameraAngles 帧计数器 */
+    int debugCameraAnglesTick;
 
     // ==================== 构造函数（私有：单例模式） ====================
 
@@ -125,6 +174,12 @@ public final class ScopeViewHandler {
         this.scopePos = null;
         this.scopeFacing = null;
         this.targetPos = null;
+        this.subLevelRetryCount = 0;
+        this.subLevelYaw = 0;
+        this.subLevelPitch = 0;
+        this.subLevelCameraPos = null;
+        this.debugSubLevelTick = 0;
+        this.debugCameraAnglesTick = 0;
 
         // 标记旧目标方块所在区块为"脏"，触发重新烘焙
         // 此时 isInScopeView 已经是 false，Mixin 不会跳过方块，区块正常渲染
@@ -132,8 +187,9 @@ public final class ScopeViewHandler {
             markSectionDirty(oldTargetPos);
         }
 
-        // 清除 CBC 火炮缓存
+        // 清除 CBC 火炮缓存和 Sable 跟踪
         CbcIntegration.getInstance().clearCache();
+        SableIntegration.getInstance().clearCache();
 
         BollyhoMod.LOGGER.debug("退出炮镜视角");
     }
@@ -160,6 +216,21 @@ public final class ScopeViewHandler {
         return targetPos;
     }
 
+    /** @return 从 SubLevel 计算的连续偏航角（度） */
+    public float getSubLevelYaw() {
+        return subLevelYaw;
+    }
+
+    /** @return 从 SubLevel 计算的连续俯仰角（度） */
+    public float getSubLevelPitch() {
+        return subLevelPitch;
+    }
+
+    /** @return 从 SubLevel 计算的相机世界坐标（Vec3 精度，可能为 null） */
+    public Vec3 getSubLevelCameraPos() {
+        return subLevelCameraPos;
+    }
+
     // ==================== 事件处理 ====================
 
     /**
@@ -168,8 +239,18 @@ public final class ScopeViewHandler {
      * <p>职责：</p>
      * <ul>
      *   <li>检测潜行键按下 → 退出炮镜视角</li>
+     *   <li><b>动态跟踪</b>：检测炮镜方块是否被旋转轴承等装置移动/旋转，
+     *       自动更新位置、朝向和目标方块。
+     *       支持主世界跟踪和 Sable SubLevel 跟踪两种模式。</li>
      *   <li>检测炮镜方块是否被破坏 → 自动退出</li>
      * </ul>
+     *
+     * <p>跟踪逻辑：</p>
+     * <ol>
+     *   <li>如果正在 SubLevel 中跟踪 → 每帧从 SubLevel pose 更新世界坐标</li>
+     *   <li>否则检查主世界炮镜是否还在原位 → 朝向变了就更新</li>
+     *   <li>主世界找不到 → 在附近搜索 → 还找不到就尝试 SubLevel</li>
+     * </ol>
      *
      * @param event 客户端 Tick 事件（Post 阶段）
      */
@@ -186,19 +267,105 @@ public final class ScopeViewHandler {
         // ---- 检测潜行键按下（只触发一次，不是按住） ----
         boolean isSneaking = mc.options.keyShift.isDown();
         if (isSneaking && !handler.wasSneaking) {
-            // 潜行键"刚刚按下" → 退出炮镜视角
             handler.exitScopeView();
             return;
         }
         handler.wasSneaking = isSneaking;
 
-        // ---- 检测炮镜方块是否仍然存在 ----
+        // ---- 动态跟踪：检测炮镜方块的位置和朝向变化 ----
         Level level = player.level();
-        BlockState state = level.getBlockState(handler.scopePos);
-        if (!(state.getBlock() instanceof ScopeBlock)) {
-            // 炮镜方块被破坏或替换了 → 自动退出
-            BollyhoMod.LOGGER.debug("炮镜方块消失，自动退出炮镜视角");
-            handler.exitScopeView();
+        SableIntegration sable = SableIntegration.getInstance();
+
+        if (sable.isTracking()) {
+            // ============================================================
+            // SubLevel 跟踪模式：炮镜在旋转轴承的物理子世界中
+            // 每帧从 SubLevel 的 renderPose 解算世界坐标
+            // ============================================================
+            handler.recalculateFromSubLevel(mc);
+            handler.subLevelRetryCount = 0; // 跟踪正常，重置重试计数
+            // DEBUG: 节流日志（每 60 帧）
+            handler.debugSubLevelTick++;
+            if (handler.debugSubLevelTick % 60 == 1) {
+                BollyhoMod.LOGGER.info("[DEBUG] ScopeView: SubLevel跟踪中 第{}帧 | "
+                        + "yaw={} pitch={} cameraPos=({}) targetPos={}",
+                        handler.debugSubLevelTick, handler.subLevelYaw, handler.subLevelPitch,
+                        handler.subLevelCameraPos, handler.targetPos);
+            }
+        } else {
+            // ============================================================
+            // 主世界跟踪模式
+            // ============================================================
+            BlockState state = level.getBlockState(handler.scopePos);
+            BlockPos oldTargetPos = handler.targetPos;
+
+            if (state.getBlock() instanceof ScopeBlock) {
+                // 炮镜仍在原位 — 检查朝向是否变化
+                handler.subLevelRetryCount = 0; // 炮镜还在，重置
+                Direction currentFacing = ScopeBlock.getViewDirection(state);
+                if (currentFacing != handler.scopeFacing) {
+                    BollyhoMod.LOGGER.debug("炮镜朝向变化: {} → {}", handler.scopeFacing, currentFacing);
+                    handler.scopeFacing = currentFacing;
+                    handler.targetPos = findPenetrationTarget(level, handler.scopePos, currentFacing);
+                }
+
+                // 尝试运动学轴承跟踪（主世界模式，方块未被移入 SubLevel）
+                if (!sable.isKinematicTracking()) {
+                    sable.tryTrackKinematicBearing(level, handler.scopePos);
+                }
+                if (sable.isKinematicTracking()) {
+                    sable.readBearingAngle(level);
+                }
+            } else {
+                // 炮镜不在原位 — 尝试定位新位置
+                // 先清除运动学轴承跟踪（如果进入 SubLevel，由 SubLevel 跟踪接管）
+                sable.clearKinematicTracking();
+                BlockPos newPos = findNearbyScope(level, handler.scopePos);
+                if (newPos != null) {
+                    handler.subLevelRetryCount = 0; // 在主世界找到了，重置
+                    BlockState newState = level.getBlockState(newPos);
+                    Direction newFacing = ScopeBlock.getViewDirection(newState);
+                    BollyhoMod.LOGGER.debug("炮镜位置变化: {} → {}, 朝向: {}",
+                            handler.scopePos, newPos, newFacing);
+                    handler.scopePos = newPos;
+                    handler.scopeFacing = newFacing;
+                    handler.targetPos = findPenetrationTarget(level, newPos, newFacing);
+                } else if (mc.level instanceof ClientLevel clientLevel
+                        && sable.tryTrackInSubLevel(clientLevel, handler.scopePos,
+                                handler.targetPos, handler.scopeFacing)) {
+                    // 主世界找不到 → 在 Sable SubLevel 中搜索成功
+                    handler.subLevelRetryCount = 0; // 跟踪成功，重置
+                    BollyhoMod.LOGGER.info("[DEBUG] ScopeView: 炮镜已转入 SubLevel 跟踪模式！"
+                            + " scopePos={} targetPos={} facing={}",
+                            handler.scopePos, handler.targetPos, handler.scopeFacing);
+                    handler.recalculateFromSubLevel(mc);
+                    return;
+                } else if (handler.subLevelRetryCount < MAX_SUBLEVEL_RETRIES) {
+                    // SubLevel 数据可能还在从服务器同步中 → 继续重试
+                    handler.subLevelRetryCount++;
+                    if (handler.subLevelRetryCount <= 3 || handler.subLevelRetryCount % 5 == 0) {
+                        BollyhoMod.LOGGER.info("[DEBUG] ScopeView: SubLevel 跟踪尝试失败，重试 {}/{}"
+                                + " (scopePos={}, targetPos={}, facing={})",
+                                handler.subLevelRetryCount, MAX_SUBLEVEL_RETRIES,
+                                handler.scopePos, handler.targetPos, handler.scopeFacing);
+                    }
+                    // 保持当前视角不变（不更新 targetPos），给网络同步留时间
+                    return;
+                } else {
+                    // 重试次数耗尽 → 真正退出
+                    BollyhoMod.LOGGER.debug("炮镜方块消失（已重试 {} 次），自动退出炮镜视角",
+                            handler.subLevelRetryCount);
+                    handler.exitScopeView();
+                    return;
+                }
+            }
+
+            // 如果目标方块位置变了，刷新旧/新目标方块的渲染
+            if (oldTargetPos != null && !oldTargetPos.equals(handler.targetPos)) {
+                markSectionDirty(oldTargetPos);
+            }
+            if (handler.targetPos != null && !handler.targetPos.equals(oldTargetPos)) {
+                markSectionDirty(handler.targetPos);
+            }
         }
     }
 
@@ -220,31 +387,118 @@ public final class ScopeViewHandler {
             return;
         }
 
-        // ---- 设置相机朝向 ----
-        // 相机位置由 CameraMixin 在 Camera.setup() 末尾设置（在实体位置被写入之后）
-        // 炮镜朝向 direction，所以从目标方块看出去的视线方向就是 facing
-        // 把 Direction 转成偏航角（yaw）和俯仰角（pitch）
-        float[] rotations = directionToYawPitch(handler.scopeFacing);
-        float yaw = rotations[0];
-        float pitch = rotations[1];
-
-        // ---- 叠加 CBC 火炮俯仰 ----
-        // 如果有 CBC 火炮底座在附近，同步俯仰角
-        // CBC 俯仰：正=仰角（炮口朝上）；MC 相机俯仰：负=仰角
-        // 所以用减法：cameraPitch = basePitch - cannonPitch
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            Float cannonPitch = CbcIntegration.getInstance()
-                    .readCannonPitch(mc.player.level());
+        CbcIntegration cbc = CbcIntegration.getInstance();
+        SableIntegration sable = SableIntegration.getInstance();
+        CbcIntegration.CannonType cannonType = cbc.getCannonType();
+
+        // ============================================================
+        // SubLevel 跟踪模式：使用 renderPose 解算的连续角度
+        // ============================================================
+        if (sable.isTracking()) {
+            // 基础角度来自 SubLevel 的 renderPose（连续，跟随轴承旋转）
+            float yaw = handler.subLevelYaw;
+            float pitch = handler.subLevelPitch;
+
+            if (cannonType == CbcIntegration.CannonType.ORIGINAL_CBC && mc.player != null) {
+                // 原版 CBC 火炮底座：叠加火炮偏航和俯仰
+                Float cannonYaw = cbc.readCannonYaw(mc.player.level());
+                Float cannonPitch = cbc.readCannonPitch(mc.player.level());
+                if (cannonYaw != null) yaw += cannonYaw;
+                if (cannonPitch != null) pitch -= cannonPitch;
+            } else if (cannonType == CbcIntegration.CannonType.COMPACT_MOUNT && mc.player != null) {
+                // 紧凑式火炮底座：只叠加俯仰，偏航完全跟随轴承
+                Float cannonPitch = cbc.readCannonPitch(mc.player.level());
+                if (cannonPitch != null) pitch -= cannonPitch;
+            }
+            // 无火炮 → 纯 SubLevel 旋转
+
+            // DEBUG: 首帧和每 60 帧输出一次
+            handler.debugCameraAnglesTick++;
+            if (handler.debugCameraAnglesTick <= 2 || handler.debugCameraAnglesTick % 60 == 0) {
+                BollyhoMod.LOGGER.info("[DEBUG] ScopeView.onCameraAngles 第{}帧: "
+                        + "subLevel(yaw={:.1f}, pitch={:.1f}) cannonType={} → event(yaw={:.1f}, pitch={:.1f})",
+                        handler.debugCameraAnglesTick,
+                        handler.subLevelYaw, handler.subLevelPitch,
+                        cannonType, yaw, pitch);
+            }
+
+            event.setYaw(yaw);
+            event.setPitch(pitch);
+            event.setRoll(0);
+            return;
+        }
+
+        // ============================================================
+        // 运动学轴承跟踪模式：从 SwivelBearing 直接读取旋转角度
+        // ============================================================
+        if (sable.isKinematicTracking()) {
+            float[] baseRotations = directionToYawPitch(handler.scopeFacing);
+            float yaw = baseRotations[0] - sable.getKinematicBearingAngle();
+            float pitch = baseRotations[1];
+
+            if (cannonType == CbcIntegration.CannonType.ORIGINAL_CBC && mc.player != null) {
+                Float cannonYaw = cbc.readCannonYaw(mc.player.level());
+                Float cannonPitch = cbc.readCannonPitch(mc.player.level());
+                if (cannonYaw != null) yaw += cannonYaw;
+                if (cannonPitch != null) pitch -= cannonPitch;
+            } else if (cannonType == CbcIntegration.CannonType.COMPACT_MOUNT && mc.player != null) {
+                Float cannonPitch = cbc.readCannonPitch(mc.player.level());
+                if (cannonPitch != null) pitch -= cannonPitch;
+            }
+
+            event.setYaw(yaw);
+            event.setPitch(pitch);
+            event.setRoll(0);
+            return;
+        }
+
+        // ============================================================
+        // 主世界模式：现有逻辑
+        // ============================================================
+
+        if (cannonType == CbcIntegration.CannonType.ORIGINAL_CBC && mc.player != null) {
+            // 原版 CBC 火炮底座：旋转轴在炮镜视角所在方块中心
+            Float cannonYaw = cbc.readCannonYaw(mc.player.level());
+            Float cannonPitch = cbc.readCannonPitch(mc.player.level());
+
+            float yaw;
+            if (cannonYaw != null) {
+                yaw = cannonYaw;
+            } else {
+                yaw = directionToYawPitch(handler.scopeFacing)[0];
+            }
+
+            float pitch = directionToYawPitch(handler.scopeFacing)[1];
             if (cannonPitch != null) {
                 pitch -= cannonPitch;
             }
-        }
 
-        // 设置偏航角、俯仰角、翻滚角
-        event.setYaw(yaw);
-        event.setPitch(pitch);
-        event.setRoll(0);
+            event.setYaw(yaw);
+            event.setPitch(pitch);
+            event.setRoll(0);
+
+        } else if (cannonType == CbcIntegration.CannonType.COMPACT_MOUNT && mc.player != null) {
+            Float cannonPitch = cbc.readCannonPitch(mc.player.level());
+
+            float[] rotations = directionToYawPitch(handler.scopeFacing);
+            float yaw = rotations[0];
+            float pitch = rotations[1];
+
+            if (cannonPitch != null) {
+                pitch -= cannonPitch;
+            }
+
+            event.setYaw(yaw);
+            event.setPitch(pitch);
+            event.setRoll(0);
+
+        } else {
+            float[] rotations = directionToYawPitch(handler.scopeFacing);
+            event.setYaw(rotations[0]);
+            event.setPitch(rotations[1]);
+            event.setRoll(0);
+        }
     }
 
     /**
@@ -285,6 +539,113 @@ public final class ScopeViewHandler {
     }
 
     // ==================== 辅助方法 ====================
+
+    /**
+     * 在指定中心周围搜索炮镜方块
+     *
+     * <p>当旋转轴承或活塞移动了炮镜方块后，原位置不再有炮镜，
+     * 此方法在半径 5 格范围内搜索炮镜方块的新位置。</p>
+     *
+     * <p>搜索范围 11×11×11（±5 各方向），足以覆盖绝大多数
+     * 机械动力旋转轴承上的结构活动范围。</p>
+     *
+     * @param level  当前世界
+     * @param center 搜索中心（通常是旧的 scopePos）
+     * @return 找到的炮镜方块位置，或 null
+     */
+    private static BlockPos findNearbyScope(Level level, BlockPos center) {
+        BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
+        int radius = 5;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -radius; dy <= radius; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    mutable.set(
+                            center.getX() + dx,
+                            center.getY() + dy,
+                            center.getZ() + dz
+                    );
+                    if (level.getBlockState(mutable).getBlock() instanceof ScopeBlock) {
+                        return mutable.immutable();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 从 Sable SubLevel 的 renderPose 重新计算炮镜的世界坐标
+     *
+     * <p>当炮镜安装在旋转轴承上（被移入 SubLevel），每帧从
+     * SubLevel 的 renderPose 变换局部偏移量到世界坐标。
+     * 使用几何变换法——不需要搜索 SubLevel 内部方块。</p>
+     *
+     * <p>工作流程：</p>
+     * <ol>
+     *   <li>从 SableIntegration 读取当前帧的世界 scopePos</li>
+     *   <li>从 SableIntegration 读取当前帧的世界 targetPos（相机位置）</li>
+     *   <li>从 SableIntegration 读取当前帧的世界 facing</li>
+     *   <li>更新 handler 状态</li>
+     * </ol>
+     *
+     * @param mc Minecraft 实例
+     */
+    private void recalculateFromSubLevel(Minecraft mc) {
+        SableIntegration sable = SableIntegration.getInstance();
+        if (!sable.isTracking()) {
+            return;
+        }
+
+        float partialTick = mc.getTimer().getGameTimeDeltaPartialTick(true);
+
+        Vec3 worldScopePos = sable.getWorldPosition(partialTick);
+        Vec3 worldTargetPos = sable.getWorldTargetPosition(partialTick);
+        Direction worldFacing = sable.getWorldFacing(partialTick);
+        Float continuousYaw = sable.getCameraYaw(partialTick);
+        Float continuousPitch = sable.getCameraPitch(partialTick);
+
+        // DEBUG: 所有值都为空时说明跟踪中断
+        if (worldScopePos == null || worldTargetPos == null || worldFacing == null) {
+            if (this.debugSubLevelTick <= 1) {
+                BollyhoMod.LOGGER.warn("[DEBUG] ScopeView.recalculate: 返回null!"
+                        + " scopePos={} targetPos={} facing={} yaw={} pitch={}",
+                        worldScopePos, worldTargetPos, worldFacing, continuousYaw, continuousPitch);
+            }
+            return;
+        }
+
+        BlockPos oldTargetPos = this.targetPos;
+
+        this.scopePos = BlockPos.containing(worldScopePos);
+        this.scopeFacing = worldFacing;
+        this.targetPos = BlockPos.containing(worldTargetPos);
+
+        // 连续角度：从 SubLevel renderPose 解算，用于平滑旋转
+        if (continuousYaw != null) {
+            this.subLevelYaw = continuousYaw;
+        }
+        if (continuousPitch != null) {
+            this.subLevelPitch = continuousPitch;
+        }
+        // 相机位置保留 Vec3 精度（避免 BlockPos.containing 的截断抖动）
+        this.subLevelCameraPos = worldTargetPos;
+
+        // DEBUG: 首帧详细输出
+        if (this.debugSubLevelTick == 0) {
+            BollyhoMod.LOGGER.info("[DEBUG] ScopeView.recalculate 首帧:"
+                    + " scopePos={} targetPos={} facing={} yaw={} pitch={} cameraPos=({}) oldTargetPos={}",
+                    this.scopePos, this.targetPos, this.scopeFacing,
+                    this.subLevelYaw, this.subLevelPitch, this.subLevelCameraPos, oldTargetPos);
+        }
+
+        // 刷新目标方块渲染（如果变化了）
+        if (oldTargetPos != null && !oldTargetPos.equals(this.targetPos)) {
+            markSectionDirty(oldTargetPos);
+        }
+        if (this.targetPos != null && !this.targetPos.equals(oldTargetPos)) {
+            markSectionDirty(this.targetPos);
+        }
+    }
 
     /**
      * 穿透扫描：沿 facing 方向穿透所有非空气方块，找到最前方的方块
